@@ -120,6 +120,10 @@ def fetch_lists(session):
             if "price_dt" not in df.columns:
                 raise RuntimeError(f"{path} 缺少交易日字段(last_dt/price_dt都没有)")
             df = df.rename(columns={"price_dt": "last_dt"})
+        # 申赎型货基(如"保证金A")无场内交易日, 丢弃避免写入 trade_dt='nan' 脏行
+        n_null = int(df["last_dt"].isna().sum())
+        if n_null:
+            df = df[df["last_dt"].notna()]
         required = {"fund_id", "fund_nm", "last_dt", "price", "volume", "unit_total"}
         missing = required - set(df.columns)
         if missing:
