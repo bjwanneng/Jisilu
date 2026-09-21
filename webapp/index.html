@@ -71,8 +71,8 @@ select.search{width:auto}
   <h1>📈 ETF 看板</h1>
   <span class="meta" id="meta"></span>
   <nav id="nav">
-    <button data-p="overview" class="on">市场温度计</button>
-    <button data-p="report">AI 解读</button>
+    <button data-p="overview" class="on">核心池温度计</button>
+    <button data-p="report">程序解读</button>
     <button data-p="opportunity">机会雷达</button>
     <button data-p="risk">暴跌风险</button>
     <button data-p="premium">折溢价</button>
@@ -98,10 +98,10 @@ async function page(p){
   catch(e){ main.innerHTML=`<div class="empty">加载失败: ${esc(e.message)}</div>`; }
 }
 
-// ---------- AI 解读 ----------
+// ---------- 程序化解读 ----------
 async function pReport(){
   const r=await api('/api/report');
-  $('#meta').textContent=`AI 程序化解读 · 数据截至 ${r.as_of} · 每日同步后自动更新`;
+  $('#meta').textContent=`固定规则程序化解读 · 数据截至 ${r.as_of} · 每日同步后自动更新`;
   const lvlTxt={danger:'危险',warn:'谨慎',calm:'健康',neutral:'中性'};
   let html=`<div class="gauge">
     <div class="gbox ${r.level_all}"><h4>全市场 <span class="badge ${r.level_all}">${lvlTxt[r.level_all]}</span></h4></div>
@@ -122,21 +122,23 @@ async function pReport(){
 async function pOverview(){
   const ov=await api('/api/overview');
   const g=ov.gauge;
+  const dq=ov.data_quality||{};
   $('#meta').textContent=`数据截至 ${ov.as_of||'-'} · ${ov.n_funds} 只 / 核心池 ${ov.n_pool} 只 · 全市场 ${fmt(ov.total_scale,0)} 亿`;
   const gbox=(title,level,sigs)=>`<div class="gbox ${level}"><h4>${title}
     <span class="badge ${level}">${{danger:'危险',warn:'谨慎',calm:'健康',neutral:'中性'}[level]}</span></h4>
     <ul>${sigs.map(s=>`<li>${esc(s)}</li>`).join('')}</ul></div>`;
-  const gdiv=g.divergence&&g.divergence.length?`<div class="card" style="border-left:4px solid var(--red)"><h3>⚡ 背离预警 · 逃顶信号<small>基于7月回测+量价机制 · 提示未来数日顶部风险</small></h3>
+  const gdiv=g.divergence&&g.divergence.length?`<div class="card" style="border-left:4px solid var(--red)"><h3>⚡ 背离预警 · 逃顶信号<small>2026-07单次事件复盘+量价机制 · 全部仍需样本外验证</small></h3>
     <ul style="padding:4px 30px;color:var(--fg);line-height:2">${g.divergence.map(s=>{
-      const verified=s.startsWith('[已验证]');
-      return `<li>${verified?'<span class="tag r">已验证</span>':'<span class="tag">机制</span>'} ${esc(s.replace(/^\[[^\]]+\]\s*/,''))}</li>`}).join('')}</ul></div>`:'';
+      const inSample=s.startsWith('[样本内]');
+      return `<li>${inSample?'<span class="tag r">样本内</span>':'<span class="tag">机制</span>'} ${esc(s.replace(/^\[[^\]]+\]\s*/,''))}</li>`}).join('')}</ul></div>`:'';
   main.innerHTML=`
   <div class="gauge">
-    ${gbox('全市场 等权指数',g.level_all,g.signals_all)}
+    ${gbox((g.universe||'核心可交易池')+' 等权指数',g.level_all,g.signals_all)}
     ${gbox('科技板块 等权指数',g.level_tech,g.signals_tech)}
   </div>
   ${gdiv}
-  <div class="card"><h3>等权指数走势<small>全市场 vs 科技板块 · 60个交易日 · MA20 · 红柱=单日≥3.5%暴涨(情绪顶峰信号)</small></h3>
+  ${dq.status==='warn'?`<div class="card" style="border-left:4px solid var(--yellow);padding:10px 14px"><b>数据质量提示</b>：${(dq.issues||[]).map(esc).join('；')}</div>`:''}
+  <div class="card"><h3>等权指数走势<small>核心可交易池 vs 科技板块 · 60个交易日 · MA20 · 红柱=单日≥3.5%暴涨(情绪顶峰信号)</small></h3>
     <div id="idxChart" style="height:340px"></div></div>
   <div class="kpis">
     <div class="kpi"><div class="l">全市场总规模</div><div class="v">${fmt(ov.total_scale,0)} 亿</div></div>
@@ -155,7 +157,7 @@ async function pOverview(){
     yAxis:[{type:'value',axisLabel:{color:'#8b949e'},splitLine:{lineStyle:{color:'#21262d'}}},
            {type:'value',name:'量比',axisLabel:{color:'#8b949e'},splitLine:{show:false}}],
     series:[
-      {name:'全市场等权',type:'line',data:g.series_all.map(r=>r.cum),showSymbol:false,lineStyle:{width:1.8,color:'#58a6ff'},itemStyle:{color:'#58a6ff'}},
+      {name:'核心池等权',type:'line',data:g.series_all.map(r=>r.cum),showSymbol:false,lineStyle:{width:1.8,color:'#58a6ff'},itemStyle:{color:'#58a6ff'}},
       {name:'科技板块等权',type:'line',data:g.series_tech.map(r=>r.cum),showSymbol:false,lineStyle:{width:1.8,color:'#d29922'},itemStyle:{color:'#d29922'}},
       {name:'全市场MA20',type:'line',data:xs.map((_,i)=>{const w=g.series_all.map(r=>r.cum);return i>=19?w.slice(i-19,i+1).reduce((a,b)=>a+b,0)/20:null}),showSymbol:false,lineStyle:{type:'dashed',color:'#30363d',width:1},itemStyle:{color:'#30363d'}},
       {name:'量比',type:'bar',yAxisIndex:1,data:g.series_all.map(r=>r.volr),itemStyle:{color:'#30363d'},barWidth:'40%'}
@@ -172,7 +174,7 @@ async function pOverview(){
 // ---------- 机会雷达 ----------
 async function pOpp(){
   const d=await api('/api/opportunity');
-  $('#meta').textContent='趋势上升 = 价>MA20>MA60且MA20上行+资金流入 · 底部特征 = 深回撤+缩量+企稳';
+  $('#meta').textContent='先过滤规模/成交/历史/高溢价，再识别趋势与底部观察；列表不是买入指令';
   const cols=[['fund_nm','名称'],['category','类别'],['index_nm','跟踪指数'],['sc','评分'],
     ['price','价格'],['ret_1d','日涨跌'],['ret_5d','5日'],['ret_20d','20日'],['ret_60d','60日'],
     ['drawdown','距50日高'],['vol_ratio','量比(5/20)'],['scale_chg_5d','份额5日'],['scale_chg_20d','份额20日'],
@@ -195,7 +197,7 @@ async function pOpp(){
     $('#stBottom').classList.toggle('on',subTab==='bottom');
     const rows=(subTab==='trend'?d.trend:d.bottom).map(r=>({...r,sc:r.trend_score??r.bottom_score}));
     $('#oppBody').innerHTML= subTab==='trend'
-      ? `<h3 style="padding:10px 14px;margin:0">趋势上升<small>多头排列+资金流入 · 顺势持有/回调买入</small></h3>`+tbl(rows)
+      ? `<h3 style="padding:10px 14px;margin:0">趋势上升<small>多头排列+资金流入 · 仅作候选，需结合仓位与止损</small></h3>`+tbl(rows)
       : `<h3 style="padding:10px 14px;margin:0">底部观察<small>深回撤(≥20%)+缩量+企稳 · 左侧信号, 需分批建仓+止损纪律, 警惕接飞刀</small></h3>`+tbl(rows);
   };
   $('#stTrend').onclick=()=>{subTab='trend';render()};
@@ -220,7 +222,7 @@ async function pRisk(){
       return `<td>${typeof v==='number'?fmt(v,v<10?2:0):esc(v??'-')}</td>`}).join('')}</tr>`).join('')}</tbody></table></div>`;
   main.innerHTML=`
   <div class="card" style="border-left:4px solid var(--red)"><h3>🔥 溢价过热<small>当前溢价≥0.8%且显著偏离自身20日中枢(均值+2σ或抬升≥0.3pct) · 回测: 7/10科创50/科创芯片溢价冲1.3-1.5%(板块中位仅0.2%)后深跌 · 追高风险区</small></h3>${tbl(d.prem_hot)}</div>
-  <div class="card"><h3>⚠️ 高位兑现信号<small>20日涨幅>15%且当日涨>5% (7/9回测: 此类品种随后平均回撤30%+) · 落袋为安区域</small></h3>${tbl(d.take_profit)}</div>
+  <div class="card"><h3>⚠️ 高位兑现观察<small>20日涨幅>15%且当日涨>5% · 仅在2026-07事件样本中观察到随后深回撤</small></h3>${tbl(d.take_profit)}</div>
   <div class="grid2">
   <div class="card"><h3>📉 回撤最深 TOP60<small>距50日高点 · 趋势交易者应回避/止损区</small></h3>${tbl(d.drawdown)}</div>
   <div class="card"><h3>🔪 接飞刀风险<small>深回撤+仍在放量下跌+散户涌入(份额5日增>5%) · 抄底禁忌区</small></h3>${tbl(d.knife)}</div>
@@ -287,7 +289,7 @@ async function showDetail(fid){
   <div class="charts"><div id="cPrice"></div><div id="cPrem"></div><div id="cShare"></div><div id="cVol"></div></div>
   <h3 style="padding:10px 0 6px;font-size:14px">历史数据<small style="color:var(--dim)"> 近${d.daily.length||d.market.length}个交易日 · 由新到旧</small></h3>
   <div class="tblwrap" style="max-height:360px"><table id="histT"><thead><tr>
-    <th>日期</th><th>价格</th><th>日涨跌</th><th>净值</th><th>溢价%</th><th>成交(万)</th><th>份额/规模(亿)</th></tr></thead>
+    <th>日期</th><th>价格</th><th>日涨跌</th><th>净值</th><th>溢价%</th><th>成交(万)</th><th>份额(万份)</th></tr></thead>
   <tbody id="histB"></tbody></table></div>`;
   const dt=d.daily.length?d.daily:d.market;
   const xs=dt.map(r=>r.trade_dt.slice(5));
@@ -307,7 +309,7 @@ async function showDetail(fid){
     mk($('#cPrice'),ser,'价格');
   }else{ $('#cPrice').innerHTML='<div class="empty">无价格数据</div>' }
   mk($('#cPrem'),[{n:'折溢价%',d:(d.daily.length?d.daily:d.market).map(r=>r.nav_discount_rt),c:'#bc8cff'}],'%');
-  mk($('#cShare'),[{n:'规模/份额',d:(d.daily.length?d.daily:d.market).map(r=>r.unit_total??r.shares),c:'#3fb950'}],'亿/亿份');
+  mk($('#cShare'),[{n:'场内份额',d:(d.daily.length?d.daily:d.market).map(r=>r.shares),c:'#3fb950'}],'万份');
   mk($('#cVol'),[{n:'成交(万)',d:(d.daily.length?d.daily:d.market).map(r=>r.volume),c:'#f85149'}],'万');
   // 历史数据表: 日涨跌优先用接口官方值(chg), 缺失时回退相邻价格回算(inc)
   const rows=(d.daily.length?d.daily:d.market).slice().reverse();
@@ -321,7 +323,7 @@ async function showDetail(fid){
     }
     return `<tr><td>${esc(r.trade_dt)}</td><td>${r.price??'-'}</td><td>${ret}</td>
     <td>${r.fund_nav??'-'}</td><td>${r.nav_discount_rt==null?'-':(r.nav_discount_rt>0?'+':'')+r.nav_discount_rt.toFixed(2)}</td>
-    <td>${r.volume==null?'-':fmt(r.volume,0)}</td><td>${r.unit_total??r.shares??'-'}</td></tr>`;}).join('');
+    <td>${r.volume==null?'-':fmt(r.volume,0)}</td><td>${r.shares??'-'}</td></tr>`;}).join('');
 }
 $('#detailOverlay').onclick=e=>{if(e.target.id==='detailOverlay')e.target.style.display='none'};
 document.addEventListener('keydown',e=>{if(e.key==='Escape')$('#detailOverlay').style.display='none'});

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""AI 解读报告 - 由 etf.db 当前数据程序化生成
+"""程序化解读报告 - 由 etf.db 当前数据按固定规则生成
 
 build_report(D) 接收 app.load_all() 的缓存数据, 输出结构化报告(dict)。
 数据每日 22:00 daily_sync 后自动刷新(app 按 db mtime 重新计算)。
@@ -82,7 +82,7 @@ def build_report(D):
                   f"{r['scale_chg_5d']:+.1f}%"] for _, r in knife.iterrows()]
 
     sec_lines = []
-    sec_lines.append(["h", "一、市场结构：钱从哪里来，到哪里去"])
+    sec_lines.append(["h", "一、核心可交易池结构：钱从哪里来，到哪里去"])
     sec_lines.append(["table", ["板块", f"自{start_dt[5:]}累计(中位)", "构成"],
                       sector_tbl])
     sec_lines.append(["p", f"资金流(近20日份额中位变化)流入前列: " +
@@ -116,6 +116,7 @@ def build_report(D):
         "as_of": as_of, "start": start_dt,
         "level_all": g["level_all"], "level_tech": g["level_tech"],
         "tech_cum": round(tech_cum, 1),
+        "data_quality": D.get("data_quality", {}),
         "sections": sec_lines,
         "generated": D["loaded_at"],
     }

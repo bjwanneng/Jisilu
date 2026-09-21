@@ -20,6 +20,9 @@ import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+from metrics import lookback_change_pct  # noqa: E402
+
 DB = ROOT / "etf.db"
 WEB = Path(__file__).resolve().parent
 
@@ -41,10 +44,12 @@ def load_all():
         if _cache["mtime"] == mtime and _cache["data"] is not None:
             return _cache["data"]
         conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA query_only=ON")
         info = pd.read_sql_query("SELECT * FROM etf_info", conn)
         daily = pd.read_sql_query(
             "SELECT fund_id, trade_dt, price, increase_rt, fund_nav, nav_discount_rt, volume, "
-            "unit_total, index_increase_rt FROM etf_daily", conn)
+            "amount, unit_total, index_increase_rt FROM etf_daily", conn)
         mkt = pd.read_sql_query("SELECT * FROM market_daily", conn)
         runs = pd.read_sql_query(
             "SELECT run_at, status, trade_dt, pool_n, market_n FROM run_log "
@@ -53,16 +58,13 @@ def load_all():
 
         daily = daily.sort_values(["fund_id", "trade_dt"])
         mkt = mkt.sort_values(["fund_id", "trade_dt"])
-        # 50日回填历史只有 amount(份额,万份) 有值 -> 资金流用份额口径
-        mkt["shares"] = mkt["amount"].where(mkt["amount"].notna() & (mkt["amount"] > 0),
-                                            mkt["unit_total"])
+        # 资金流严格使用份额(万份)。unit_total 是资产规模(亿元)，两者量纲
+        # 不同，绝不能在份额缺失时相互填充。
+        mkt["shares"] = mkt["amount"].where(mkt["amount"].notna() & (mkt["amount"] > 0))
 
         # ---- 全市场: 资金流/成交/折溢价 ----
         def pct_ndays(g, col, n):
-            g = g.dropna(subset=[col])
-            if len(g) < 2:
-                return np.nan
-            return (g[col].iloc[-1] / g[col].iloc[min(n, len(g) - 1)] - 1) * 100
+            return lookback_change_pct(g[col], n)
 
         rows = []
         for fid, g in mkt.groupby("fund_id"):
@@ -141,16 +143,26 @@ def load_all():
         # ---- 板块指数(等权中位数) + 市场温度计 ----
         mkt_sig = market_gauge(daily, cross, mkt)
 
-        # ---- 机会: 趋势上升 / 底部特征 ----
+        # ---- 机会: 先过可交易性门槛，再判断趋势 / 底部特征 ----
         c = cross
-        base = c[c["scale"].notna() & (c["scale"] >= 2)].copy()
+        cross["tradeable"] = (
+            (cross["scale"] >= 2)
+            & (cross["vol_avg_20d"] >= 1000)
+            & (cross["days"] >= 20)
+            & (cross["discount_now"].isna() | (cross["discount_now"] <= 1.0))
+        )
+        base = c[c["tradeable"]].copy()
         trend = base[(base["price"] > base["ma20"]) & (base["ma20"] > base["ma60"])
-                     & (base["ma20_slope"] > 0.3) & (base["ret_20d"] > 3)].copy()
+                     & (base["ma20_slope"] > 0.3) & (base["ret_20d"] > 3)
+                     & ~base["prem_hot"].fillna(False)].copy()
         trend["trend_score"] = (trend["ret_20d"].fillna(0).clip(-30, 60) * 0.4
                                 + trend["scale_chg_20d"].fillna(0).clip(-50, 100) * 0.3
                                 + trend["vol_avg_5d"].fillna(0).apply(lambda v: min(np.log10(max(v, 1)) * 8, 30))).round(1)
+        knife_mask = ((base["drawdown"] < -15) & (base["ret_5d"] < -3)
+                      & (base["scale_chg_5d"] > 5))
         bottom = base[(base["drawdown"] < -20) & (base["ret_5d"] > -2)
-                      & (base["vol_ratio"] < 1.0)].copy()
+                      & (base["vol_ratio"] < 1.0) & ~knife_mask
+                      & ~base["prem_hot"].fillna(False)].copy()
         bottom["bottom_score"] = ((-bottom["drawdown"].fillna(0)).clip(0, 40) * 0.5
                                   + (-bottom["discount_now"].fillna(0)).clip(0, 5) * 3
                                   + bottom["scale_chg_5d"].fillna(0).clip(-10, 20) * 0.8
@@ -169,22 +181,28 @@ def load_all():
         # 溢价过热: 个基溢价冲高(≥0.8%且偏离自身中枢), 7/10科创50/科创芯片1.3-1.5%后深跌
         m = cross["prem_hot"].fillna(False)
         cross.loc[m, "risk"] = (cross.loc[m, "risk"].fillna("") + "|溢价过热").str.strip("|")
-        # 高位兑现信号: 前期大涨后单日暴涨(情绪顶峰, 回测: 7/9涨停潮后平均回撤30%+)
+        # 高位兑现观察: 前期大涨后单日暴涨（仅有2026-07事件样本）
         cross["take_profit"] = ((cross["ret_20d"] > 15) & (cross["ret_1d"] > 5)) | \
                                ((cross["ret_5d"] > 10) & (cross["vol_ratio"] > 1.5))
         # 下跌接刀风险: 深回撤仍在放量下跌/份额暴增(散户接盘)
         cross["knife"] = ((cross["drawdown"] < -15) & (cross["ret_5d"] < -3)
                           & (cross["scale_chg_5d"] > 5))
 
+        data_quality = assess_data_quality(info, daily, mkt, runs)
         data = {"cross": cross, "trend": trend, "bottom": bottom, "daily": daily,
                 "mkt": mkt, "runs": runs, "gauge": mkt_sig,
+                "data_quality": data_quality,
                 "loaded_at": datetime.now().isoformat(timespec="seconds")}
         _cache.update(mtime=mtime, data=data)
         return data
 
 
 def market_gauge(daily, cross, mkt):
-    """板块级市场温度计: 等权中位数收益序列 + 规则评估"""
+    """核心可交易池温度计: 等权中位数收益序列 + 规则评估。
+
+    历史表只覆盖当时的核心池，因此不能严谨地称为“全市场”。明确命名
+    可以避免使用当前成分回看历史所造成的幸存者偏差误读。
+    """
     d = daily.sort_values(["fund_id", "trade_dt"]).copy()
     d["ret"] = d.groupby("fund_id")["price"].pct_change() * 100
     d.loc[d["ret"].abs() > 20, "ret"] = np.nan
@@ -211,7 +229,7 @@ def market_gauge(daily, cross, mkt):
         climax = [i for i, v in enumerate(r) if v is not None and not np.isnan(v) and v >= 3.5]
         if climax:
             after = r[climax[-1] + 1:]
-            sig.append(f"近期出现单日暴涨{r[climax[-1]]:+.1f}%(情绪顶峰, 回测显示此后的追高品种平均回撤30%+)")
+            sig.append(f"近期出现单日暴涨{r[climax[-1]]:+.1f}%(情绪顶峰；2026-07事件样本中随后回撤较大)")
             if any(v is not None and not np.isnan(v) and v <= -2 for v in after):
                 sig.append("暴涨后出现 ≥2% 阴线 → 顶部反转确认, 应减仓而非抄底")
         # 2. 趋势
@@ -240,6 +258,7 @@ def market_gauge(daily, cross, mkt):
     # ---- 背离预警(逃顶信号) ----
     div = divergences(d, tech, allx, tpm=None)
     return {
+        "universe": "核心可交易池",
         "series_all": [{"dt": i, "cum": round(r["cum"], 2), "ret": None if pd.isna(r["ret"]) else round(r["ret"], 2),
                          "volr": None if pd.isna(r["volr"]) else round(r["volr"], 2)} for i, r in allx.tail(60).iterrows()],
         "series_tech": [{"dt": i, "cum": round(r["cum"], 2)} for i, r in tech.tail(60).iterrows()],
@@ -249,10 +268,35 @@ def market_gauge(daily, cross, mkt):
     }
 
 
+def assess_data_quality(info, daily, mkt, runs):
+    """Produce a small, explicit gate before users act on derived signals."""
+    issues = []
+    as_of = mkt["trade_dt"].max() if len(mkt) else None
+    latest = mkt[mkt["trade_dt"] == as_of] if as_of else mkt.iloc[0:0]
+    coverage = (latest["price"].notna().mean() * 100) if len(latest) else 0.0
+    duplicates = int(mkt.duplicated(["fund_id", "trade_dt"]).sum())
+    latest_run_ok = bool(len(runs) and runs.iloc[0]["status"] in ("OK", "SKIP"))
+    if not latest_run_ok:
+        issues.append("最近一次同步失败或缺少运行记录")
+    if coverage < 95:
+        issues.append(f"最新交易日价格覆盖率仅 {coverage:.1f}%")
+    if duplicates:
+        issues.append(f"存在 {duplicates} 条基金/日期重复记录")
+    if len(daily) < max(len(info), 1):
+        issues.append("核心池历史样本不足")
+    return {
+        "status": "warn" if issues else "ok",
+        "as_of": as_of,
+        "latest_rows": int(len(latest)),
+        "price_coverage_pct": round(coverage, 1),
+        "issues": issues,
+    }
+
+
 def divergences(d, tech_idx, all_idx, tpm=None):
     """背离类逃顶预警。基于7月回测 + 经典量价机制, 逐日检查最近5个交易日。
 
-    信号分级: [已验证]=本轮7/9前后回测有效; [机制]=经典机制推演, 样本不足待验证
+    信号分级: [样本内]=仅在2026-07事件复盘中有效; [机制]=经典机制推演, 均待样本外验证
     """
     sig = []
     dd = d.copy()
@@ -279,13 +323,13 @@ def divergences(d, tech_idx, all_idx, tpm=None):
     ret_now = ret_t.iloc[-1] if pd.notna(ret_t.iloc[-1]) else 0
     hi20 = cum_t.tail(20).max()
 
-    # 1 溢价-价格同涨(追价) [已验证: 7/8-7/9 溢价0.08->0.22与+5.25%暴涨同步, 随后板块-19%]
+    # 1 溢价-价格同涨(追价) [样本内: 7/8-7/9 溢价与暴涨同步, 随后板块回撤]
     if pd.notna(pm_chg5) and pm_chg5 > 0.05 and r5_t > 0.02:
-        sig.append(f"[已验证] 价格上涨伴随溢价5日抬升{pm_chg5:+.2f}pct → 追价买入/情绪过热, "
+        sig.append(f"[样本内] 价格上涨伴随溢价5日抬升{pm_chg5:+.2f}pct → 追价买入/情绪过热, "
                    "顶部特征, 兑现窗口")
-    # 2 跌而溢价不降(承接幻觉) [已验证: 7/10 价格-2.98%溢价仍0.215%, 次日继续崩]
+    # 2 跌而溢价不降(承接幻觉) [样本内: 7/10 大跌时溢价仍高, 次日续跌]
     if ret_now < -2 and pd.notna(pm_now) and pm_now > pm_base:
-        sig.append("[已验证] 大跌日溢价未回落 → 抄底盘仍在硬扛, 抛压未释放完毕")
+        sig.append("[样本内] 大跌日溢价未回落 → 抄底盘仍在硬扛, 抛压未释放完毕")
     # 3 宽基-科技背离(抽血) [机制]
     if r5_t > 0.02 and r5_a < 0.003:
         sig.append(f"[机制] 科技5日{r5_t*100:+.1f}% vs 宽基{r5_a*100:+.1f}% → 资金抽血式行情, "
@@ -296,7 +340,7 @@ def divergences(d, tech_idx, all_idx, tpm=None):
     # 5 放量滞涨/派发 [机制]
     if vol5 > 1.2 and abs(r5_t) < 0.01:
         sig.append(f"[机制] 量能放大至5/20日的{vol5:.1f}倍但价格原地踏步 → 高位派发出货特征")
-    # 6 资金-价格背离(份额) [已验证: 7月中旬以来科技份额+22%价格-19%]
+    # 6 资金-价格背离(份额) [样本内: 7月中旬以来科技份额增、价格跌]
     # (板块级份额判断在报告里, 这里不重复)
     # 7 动量衰竭 [机制]
     m1 = back(cum_t, 1) / back(cum_t, 6, cum_t.iloc[0]) - 1 if len(cum_t) > 7 else 0
@@ -366,6 +410,7 @@ class Handler(SimpleHTTPRequestHandler):
                 "cats": dfj(cross.groupby("category").agg(
                     n=("fund_id", "count"), scale=("scale", "sum")).reset_index()),
                 "gauge": D["gauge"],
+                "data_quality": D["data_quality"],
                 "last_runs": dfj(runs.head(5)),
             })
 
@@ -374,7 +419,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "ret_1d", "ret_5d", "ret_20d", "ret_60d", "drawdown", "ma20", "ma60",
                     "scale", "scale_chg_5d", "scale_chg_20d", "scale_chg_50d",
                     "discount_now", "premium_mean", "vol_avg_5d", "vol_ratio",
-                    "down_streak", "t0", "fee", "risk"]
+                    "down_streak", "t0", "fee", "tradeable", "risk"]
             return self._json(dfj(cross, [c for c in cols if c in cross.columns]))
 
         if path == "/api/opportunity":
@@ -420,15 +465,20 @@ class Handler(SimpleHTTPRequestHandler):
             d = D["daily"][D["daily"]["fund_id"] == fid]
             m = D["mkt"][D["mkt"]["fund_id"] == fid]
             i = cross[cross["fund_id"] == fid]
+            # A former pool member may have stale rich history while the lean
+            # market table is current.  Prefer the freshest series.
+            if len(m) and len(d) and d["trade_dt"].max() < m["trade_dt"].max():
+                d = d.iloc[0:0]
             return self._json({
                 "info": dfj(i.head(1)),
-                "daily": dfj(d.assign(inc=lambda x: x["price"].pct_change(-1) * 100,
+                "daily": dfj(d.assign(shares=lambda x: x["amount"],
+                                      inc=lambda x: x["price"].pct_change() * 100,
                                       chg=lambda x: x["increase_rt"]),
                              ["trade_dt", "price", "fund_nav", "nav_discount_rt",
-                              "volume", "unit_total", "inc", "chg"]),
+                              "volume", "unit_total", "shares", "inc", "chg"]),
                 "market": dfj(m.assign(shares=lambda x: x["amount"].where(
-                    x["amount"].notna() & (x["amount"] > 0), x["unit_total"]),
-                    inc=lambda x: x["price"].pct_change(-1) * 100,
+                    x["amount"].notna() & (x["amount"] > 0)),
+                    inc=lambda x: x["price"].pct_change() * 100,
                     chg=lambda x: x["increase_rt"]),
                     ["trade_dt", "price", "volume", "unit_total", "shares",
                      "nav_discount_rt", "inc", "chg"]),
@@ -438,10 +488,15 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 def main():
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8787
-    srv = HTTPServer(("0.0.0.0", port), Handler)
+    import argparse
+    ap = argparse.ArgumentParser(description="ETF 本地研究看板")
+    ap.add_argument("port", nargs="?", type=int, default=8787)
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="监听地址；仅在可信网络明确需要远程访问时使用 0.0.0.0")
+    args = ap.parse_args()
+    srv = HTTPServer((args.host, args.port), Handler)
     load_all()  # 预热
-    print(f"ETF 看板 v2: http://0.0.0.0:{port}")
+    print(f"ETF 看板 v2: http://{args.host}:{args.port}")
     srv.serve_forever()
 
 

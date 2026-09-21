@@ -57,6 +57,8 @@ def valid_cross(cross):
     return cross
 
 SCHEMA = """
+PRAGMA journal_mode=WAL;
+PRAGMA busy_timeout=5000;
 CREATE TABLE IF NOT EXISTS etf_info (
   fund_id TEXT PRIMARY KEY, fund_nm TEXT, category TEXT, index_nm TEXT,
   fee REAL, m_fee REAL, t_fee REAL, issuer_nm TEXT, t0 TEXT,
@@ -110,18 +112,28 @@ def fetch_lists(session):
         df = pd.DataFrame([row["cell"] for row in d.get("rows", [])])
         if df.empty:
             raise RuntimeError(f"{path} 返回空, 可能登录失效")
+        required = {"fund_id", "fund_nm", "last_dt", "price", "volume", "unit_total"}
+        missing = required - set(df.columns)
+        if missing:
+            raise RuntimeError(f"{path} 缺少必要字段: {sorted(missing)}")
         df["category"] = cat
         frames.append(df)
     return pd.concat(frames, ignore_index=True)
 
 
 def avg_volume_from_db(conn, days=20):
-    """近N次运行的日均成交(万), 首日无历史返回空DataFrame"""
+    """最近 N 个交易日的日均成交(万), 首日无历史返回空DataFrame。"""
     try:
         return pd.read_sql_query(
-            f"SELECT fund_id, AVG(volume) AS avg_vol FROM market_daily "
-            f"WHERE trade_dt >= date('now','localtime','-{days+5} day') "
-            f"GROUP BY fund_id", conn)
+            """WITH recent_dates AS (
+                   SELECT DISTINCT trade_dt FROM market_daily
+                   WHERE trade_dt IS NOT NULL
+                   ORDER BY trade_dt DESC LIMIT ?
+               )
+               SELECT fund_id, AVG(volume) AS avg_vol
+               FROM market_daily
+               WHERE trade_dt IN (SELECT trade_dt FROM recent_dates)
+               GROUP BY fund_id""", conn, params=(days,))
     except pd.errors.DatabaseError:
         return pd.DataFrame(columns=["fund_id", "avg_vol"])
 
@@ -186,7 +198,11 @@ def sync_info(conn, cross, now):
 
 
 def sync_daily(conn, cross, trade_dt):
-    """核心池 -> etf_daily; 全市场瘦身 -> market_daily。交易日取各行 last_dt 众数"""
+    """核心池 -> etf_daily; 全市场 -> market_daily。
+
+    每行使用接口自己的 last_dt，避免停牌或单个接口延迟时把旧价格伪装成
+    当日价格。返回的 trade_dt 仅代表本次运行的市场主交易日（众数）。
+    """
     if trade_dt is None:
         last = cross["last_dt"].mode()
         if last.empty:
@@ -194,7 +210,11 @@ def sync_daily(conn, cross, trade_dt):
         trade_dt = str(last.iloc[0])
 
     pool = cross[cross["in_pool"] == 1]
-    rows = [(r["fund_id"], trade_dt, num(r.get("price")), num(r.get("increase_rt")),
+    def row_dt(r):
+        value = r.get("last_dt")
+        return str(value) if value not in (None, "", "-") else trade_dt
+
+    rows = [(r["fund_id"], row_dt(r), num(r.get("price")), num(r.get("increase_rt")),
              num(r.get("fund_nav")), num(r.get("nav_discount_rt")),
              num(r.get("volume")), num(r.get("amount")), num(r.get("amount_incr")),
              num(r.get("unit_total")), num(r.get("index_increase_rt")))
@@ -202,7 +222,7 @@ def sync_daily(conn, cross, trade_dt):
     conn.executemany(
         """INSERT OR REPLACE INTO etf_daily VALUES (?,?,?,?,?,?,?,?,?,?,?)""", rows)
 
-    mrows = [(r["fund_id"], trade_dt, num(r.get("unit_total")), num(r.get("volume")),
+    mrows = [(r["fund_id"], row_dt(r), num(r.get("unit_total")), num(r.get("volume")),
               num(r.get("nav_discount_rt")), num(r.get("amount")),
               num(r.get("price")), num(r.get("increase_rt")))
              for _, r in cross.iterrows()]
@@ -229,14 +249,15 @@ def backfill_history(conn):
                     continue
                 if fid in pool_ids:
                     daily.append((fid, dt, num(c.get("trade_price")),
-                                  num(c.get("idx_incr_rt")), num(c.get("fund_nav")),
+                                  num(c.get("increase_rt")), num(c.get("fund_nav")),
                                   num(c.get("discount_rt")), num(c.get("volume")),
                                   num(c.get("amount")), num(c.get("amount_incr")),
                                   None, num(c.get("idx_incr_rt"))))
                 mkt.append((fid, dt, None, num(c.get("volume")),
-                            num(c.get("discount_rt")), num(c.get("amount"))))
+                            num(c.get("discount_rt")), num(c.get("amount")),
+                            num(c.get("trade_price")), num(c.get("increase_rt"))))
     conn.executemany("INSERT OR REPLACE INTO etf_daily VALUES (?,?,?,?,?,?,?,?,?,?,?)", daily)
-    conn.executemany("INSERT OR REPLACE INTO market_daily VALUES (?,?,?,?,?,?)", mkt)
+    conn.executemany("INSERT OR REPLACE INTO market_daily VALUES (?,?,?,?,?,?,?,?)", mkt)
     return len(daily)
 
 

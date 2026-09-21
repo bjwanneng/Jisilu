@@ -12,6 +12,8 @@ from datetime import date
 import numpy as np
 import pandas as pd
 
+from metrics import lookback_change_pct
+
 TODAY = date.today().strftime("%Y%m%d")
 
 # ---------- 数据加载与清洗 ----------
@@ -178,10 +180,7 @@ def history_stats(hist):
     agg["份额50日变化%"] = (agg["最新份额"] / agg["期初份额"] - 1) * 100
 
     def pct_change_ndays(x, n):
-        x = x.dropna()
-        if len(x) < 2:
-            return np.nan
-        return (x.iloc[-1] / x.iloc[min(n, len(x)-1)] - 1) * 100
+        return lookback_change_pct(x, n)
 
     agg["份额近5日变化%"] = hist.groupby("代码")["份额(万份)"].apply(
         lambda x: pct_change_ndays(x, 5))
