@@ -99,7 +99,11 @@ def num(s):
 
 
 def fetch_lists(session):
-    """拉三类ETF列表, 返回 DataFrame + 每行的交易日 last_dt"""
+    """拉三类ETF列表, 返回 DataFrame + 每行的交易日 last_dt
+
+    接口兼容: 2026-09 起货币ETF接口不再返回 last_dt, 改为 price_dt(交易日)
+    + last_time(时间), 这里统一归一化成 last_dt。
+    """
     import requests
     frames = []
     for path, cat in [("/data/etf/etf_list/", "指数ETF"),
@@ -112,6 +116,10 @@ def fetch_lists(session):
         df = pd.DataFrame([row["cell"] for row in d.get("rows", [])])
         if df.empty:
             raise RuntimeError(f"{path} 返回空, 可能登录失效")
+        if "last_dt" not in df.columns:
+            if "price_dt" not in df.columns:
+                raise RuntimeError(f"{path} 缺少交易日字段(last_dt/price_dt都没有)")
+            df = df.rename(columns={"price_dt": "last_dt"})
         required = {"fund_id", "fund_nm", "last_dt", "price", "volume", "unit_total"}
         missing = required - set(df.columns)
         if missing:
