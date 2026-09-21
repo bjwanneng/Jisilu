@@ -301,12 +301,18 @@ async function showDetail(fid){
     series:series.map(s=>({name:s.n,type:'line',data:s.d,showSymbol:false,
       lineStyle:{width:1.6,color:s.c},itemStyle:{color:s.c}})),
     legend:{textStyle:{color:'#8b949e'},top:0}});
-  const px=d.daily.length?d.daily.map(r=>r.price):d.market.map(r=>r.price);
+  const px=d.daily.length?d.daily.map(r=>r.price):d.market.map(r=>r.price_adj??r.price);
   if(px.some(v=>v!=null)){
     const p=px.map((v,j)=>v!=null&&j>0&&Math.abs(v/ (px[j-1]||1)-1)>0.2?null:v);
-    const ser=[{n:'价格',d:p,c:'#58a6ff'}];
+    const ser=[{n:d.splits&&d.splits.length?'价格(复权)':'价格',d:p,c:'#58a6ff'}];
     if(d.daily.length&&d.daily.some(r=>r.fund_nav!=null))ser.push({n:'净值',d:d.daily.map(r=>r.fund_nav),c:'#d29922'});
     mk($('#cPrice'),ser,'价格');
+    // 标记份额折算日
+    if(d.splits&&d.splits.length){
+      const chart=echarts.getInstanceByDom($('#cPrice'));
+      chart.setOption({series:[{markPoint:{symbol:'pin',symbolSize:44,label:{fontSize:9,formatter:'折算'},
+        itemStyle:{color:'#d29922'},data:d.splits.map(([dt,k])=>({coord:[dt.slice(5),null],value:'',name:'折算',xAxis:dt.slice(5),yAxis:'max'}))}}]});
+    }
   }else{ $('#cPrice').innerHTML='<div class="empty">无价格数据</div>' }
   mk($('#cPrem'),[{n:'折溢价%',d:(d.daily.length?d.daily:d.market).map(r=>r.nav_discount_rt),c:'#bc8cff'}],'%');
   mk($('#cShare'),[{n:'场内份额',d:(d.daily.length?d.daily:d.market).map(r=>r.shares),c:'#3fb950'}],'万份');

@@ -33,6 +33,38 @@ _lock = threading.Lock()
 _cache = {"mtime": None, "data": None}
 
 
+def adjusted_prices(g, jump=0.2, tol=0.3):
+    """份额折算复权: 返回(复权价序列, [(折算日, 因子k), ...])
+
+    折算日特征: 价格÷k 而份额×k, 规模不变。用价格比与份额比互为倒数确认,
+    避免把双创ETF的±20%涨跌停误判成折算。确认后将折算日之前的历史价格统一
+    乘以k, 使整条序列连续可比(回撤/均线/涨幅恢复正常)。
+    未经份额确认的跳变仍置NaN(保守处理)。
+    """
+    pr = g["price"].astype(float)
+    sh = g["shares"].astype(float)
+    ret = pr.pct_change()
+    splits = []
+    for i in range(1, len(pr)):
+        r = ret.iloc[i]
+        if pd.isna(r) or abs(r) < jump:
+            continue
+        k = pr.iloc[i] / pr.iloc[i - 1]          # 价格因子(如 1拆5 -> 0.2)
+        sa, sb = sh.iloc[i], sh.iloc[i - 1]
+        if pd.notna(sa) and pd.notna(sb) and sa > 0 and sb > 0:
+            ksh = sa / sb                          # 份额因子(应 ~1/k)
+            if abs(k * ksh - 1) <= tol:            # 规模不变 -> 确认折算
+                splits.append((pr.index[i], k))
+    adj = pd.Series(1.0, index=pr.index)
+    idx_pos = list(pr.index)
+    for dt, k in splits:
+        adj.iloc[:idx_pos.index(dt)] *= k          # 折算日之前整体乘k
+    p = pr * adj
+    # 未能确认的跳变日保守置空
+    p[p.pct_change().abs() >= jump] = np.nan
+    return p, splits
+
+
 # ---------- 数据层 ----------
 
 def load_all():
@@ -97,8 +129,7 @@ def load_all():
         tech = []
         for fid, g in mkt.groupby("fund_id"):
             g = g.sort_values("trade_dt")
-            # 只屏蔽真实的>=20%跳变(份额折算); 价格断层日的pct_change为NaN不应屏蔽
-            p = g["price"].where(~(g["price"].pct_change().abs() >= 0.2))
+            p, _splits = adjusted_prices(g)
             if len(p.dropna()) < 2:
                 continue
             ma20 = p.rolling(20, min_periods=10).mean()
@@ -463,12 +494,18 @@ class Handler(SimpleHTTPRequestHandler):
         if path.startswith("/api/detail/"):
             fid = path.split("/")[-1]
             d = D["daily"][D["daily"]["fund_id"] == fid]
-            m = D["mkt"][D["mkt"]["fund_id"] == fid]
+            m = D["mkt"][D["mkt"]["fund_id"] == fid].sort_values("trade_dt")
             i = cross[cross["fund_id"] == fid]
             # A former pool member may have stale rich history while the lean
             # market table is current.  Prefer the freshest series.
             if len(m) and len(d) and d["trade_dt"].max() < m["trade_dt"].max():
                 d = d.iloc[0:0]
+            m = m.assign(shares=lambda x: x["amount"].where(
+                x["amount"].notna() & (x["amount"] > 0), x["unit_total"])).set_index("trade_dt")
+            p_adj, splits = adjusted_prices(m) if len(m) else (None, [])
+            m = m.reset_index()
+            if p_adj is not None:
+                m["price_adj"] = p_adj.to_numpy()
             return self._json({
                 "info": dfj(i.head(1)),
                 "daily": dfj(d.assign(shares=lambda x: x["amount"],
@@ -476,12 +513,12 @@ class Handler(SimpleHTTPRequestHandler):
                                       chg=lambda x: x["increase_rt"]),
                              ["trade_dt", "price", "fund_nav", "nav_discount_rt",
                               "volume", "unit_total", "shares", "inc", "chg"]),
-                "market": dfj(m.assign(shares=lambda x: x["amount"].where(
-                    x["amount"].notna() & (x["amount"] > 0)),
+                "market": dfj(m.assign(
                     inc=lambda x: x["price"].pct_change() * 100,
                     chg=lambda x: x["increase_rt"]),
-                    ["trade_dt", "price", "volume", "unit_total", "shares",
+                    ["trade_dt", "price", "price_adj", "volume", "unit_total", "shares",
                      "nav_discount_rt", "inc", "chg"]),
+                "splits": [[str(dt), round(k, 4)] for dt, k in splits],
             })
 
         return self._json({"error": "not found"}, 404)
