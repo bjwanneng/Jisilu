@@ -1,0 +1,23 @@
+# 敏感信息 - 绝不上传
+jisilu_cred.json
+jisilu_session.json
+
+# 数据文件(体积大, 本地资产)
+*.db
+*.jsonl
+*_full.json
+etf_backup.db
+
+# 生成产物
+ETF分析报告_*.xlsx
+ETF分析摘要_*.md
+市场解读_*.md
+
+# 运行环境
+.venv/
+__pycache__/
+*.pyc
+*.log
+nohup.out
+.DS_Store
+.moved.txt
